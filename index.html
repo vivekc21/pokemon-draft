@@ -79,14 +79,74 @@ const P=id=>POKE[id-1]||POKE.find(p=>p.id===id);
 const slotsOf=()=>S.mode==="all22"?ALL22:Array.from({length:S.size},(_,i)=>"#"+(i+1));
 const total=()=>S.players.length*slotsOf().length;
 function who(n){const k=S.players.length,r=Math.floor(n/k),i=n%k;return S.order==="snake"&&r%2?k-1-i:i}
-const save=()=>{localStorage.setItem("pkdraft_state",JSON.stringify(S));};
+const save=()=>{localStorage.setItem("pkdraft_state",JSON.stringify(S));if(ROOM&&S)localStorage.setItem("pkdraft_room_"+ROOM,JSON.stringify(S));};
+// ---------- Multiplayer: shared ordered op-log on ntfy.sh (no account, no keys) ----------
+// Every client applies the same ops in the same server order. An op is accepted only if its
+// base version equals the current version (compare-and-set), so the first write wins everywhere.
+let ROOM=null,ISHOST=false,HK=null,SEAT=null,OVR=false,LIVE=false,V=0,es=null,seen=new Set(),mine=new Map(),lastId="all",pollT=null;
+const NTFY="https://ntfy.sh/",TOPIC=()=>"pkdraft-v1-"+ROOM;
+const mkCode=()=>Array.from({length:6},()=>"ABCDEFGHJKMNPQRSTUVWXYZ23456789"[Math.floor(Math.random()*31)]).join("");
+const joinURL=()=>location.origin+location.pathname+"?room="+ROOM;
+const seatKey=()=>"pkdraft_seat_"+ROOM;
+const packS=o=>o&&{...o,picks:o.picks.map(x=>[x.p,x.id,x.slot])},unpackS=o=>o&&{...o,picks:o.picks.map(([p,id,slot])=>({p,id,slot}))};
+function setSeat(v){SEAT=v;localStorage.setItem(seatKey(),v);render()}
+function applyOp(op,seat,host){
+ if(op.t==="setup"){if(S&&!host)return "Only the host can change setup";S={...op.S,picks:op.S.picks||[],host:S&&S.host||op.hk};return null}
+ if(op.t==="new"){if(!host)return "Only the host can start over";S=null;return null}
+ if(!S)return "No draft";const n=S.picks.length,cur=who(n);
+ if(op.t==="pick"){if(n>=total())return "Draft is complete";
+  if(!(seat===cur||(host&&(op.ovr||!ROOM))))return "It's "+S.players[cur]+"'s turn";
+  if(S.picks.some(x=>x.id===op.id))return "Already taken";
+  if(S.picks.some(x=>x.p===cur&&x.slot===op.slot)||!slotsOf().includes(op.slot))return "Slot not available";
+  const p=P(op.id);if(!p||!inPool(p))return "Not in pool";
+  S.picks.push({p:cur,id:op.id,slot:op.slot});return null}
+ if(op.t==="undo"){if(!n)return "Nothing to undo";const last=S.picks[n-1];if(!(host||seat===last.p))return "Only the host or the player who picked can undo";S.picks.pop();return null}
+ return "Bad op"}
+const isHostOp=op=>!!(op.hk&&(!S||!S.host||op.hk===S.host));
+function commit(op){
+ if(!ROOM){const e=applyOp(op,-9,true);if(e)return toast(e);save();if(!S)localStorage.removeItem("pkdraft_state");render();return}
+ if(ISHOST)op.hk=HK;op.seat=SEAT;
+ const bak=JSON.stringify(S),e=applyOp(op,SEAT,isHostOp(op));S=JSON.parse(bak);if(e)return toast(e); // pre-check only
+ const rid=Math.random().toString(36).slice(2);mine.set(rid,op);
+ fetch(NTFY+TOPIC(),{method:"POST",body:JSON.stringify({v:V,rid,op})}).then(r=>{if(!r.ok)throw r.status}).catch(err=>{mine.delete(rid);toast("Couldn't send — check connection ("+err+")")})}
+function handle(m){if(m.event!=="message"||seen.has(m.id))return;seen.add(m.id);lastId=m.id;let d;try{d=JSON.parse(m.message)}catch(e){return}
+ const was=mine.get(d.rid);mine.delete(d.rid);
+ if(d.v!==V){if(was)toast("Too slow — someone else moved first");return}
+ const e=applyOp(d.op,d.op.seat,isHostOp(d.op));if(e){if(was)toast(e);return}
+ V++;save();if(document.querySelector(".modal")&&!was)document.querySelector(".modal:not(.keep)")?.remove();render()}
+async function subscribe(){await poll(); // replay the log in order first, then stream what comes after it
+ es&&es.close();es=new EventSource(NTFY+TOPIC()+"/sse?since="+lastId);
+ es.onopen=()=>{LIVE=true;clearInterval(pollT);pollT=null;render()};
+ // SSE fan-out order can differ per client, so it is only a wake-up signal; the cached log
+ // (read by poll) is the single canonical order everyone applies. The cache is written in
+ // small batches, so retry briefly until the new message shows up there.
+ es.onmessage=e=>{let id;try{id=JSON.parse(e.data).id}catch(x){}let k=0;const go=async()=>{await poll();if(id&&!seen.has(id)&&++k<12)setTimeout(go,350)};go()};
+ es.onerror=()=>{if(LIVE){LIVE=false;render()}if(!pollT)pollT=setInterval(poll,1500)}}
+let polling=false,again=false;async function poll(){if(polling){again=true;return}polling=true;try{do{again=false;const t=await (await fetch(NTFY+TOPIC()+"/json?poll=1&since="+lastId,{cache:"no-store"})).text();t.split("\n").filter(Boolean).forEach(l=>handle(JSON.parse(l)))}while(again)}catch(e){}polling=false}
+function joinRoom(code){ROOM=code;HK=localStorage.getItem("pkdraft_host_"+code);ISHOST=!!HK;const st=localStorage.getItem(seatKey());SEAT=st===null?null:+st;
+ history.replaceState(null,"",location.pathname+"?room="+code);
+ try{S=JSON.parse(localStorage.getItem("pkdraft_room_"+code))}catch(e){} // offline fallback until log replays
+ const cached=S;S=null;V=0; // rebuild from shared log
+ subscribe();setInterval(()=>{if(LIVE)poll()},10000);setTimeout(()=>{if(!LIVE&&V===0&&cached){S=cached;render();toast("Offline — showing saved copy")}},6000)}
+function goLive(){const code=mkCode();HK=Math.random().toString(36).slice(2)+Date.now().toString(36);localStorage.setItem("pkdraft_host_"+code,HK);
+ localStorage.setItem("pkdraft_seat_"+code,SEAT===null?0:SEAT);const base=S;joinRoom(code);ISHOST=true;
+ if(base){const NS={...base};delete NS.host;S=null;commit({t:"setup",S:NS})}
+ inviteBox()}
+function inviteBox(){const u=joinURL();navigator.clipboard?.writeText(u).catch(()=>{});const m=document.createElement("div");m.className="modal keep";
+ m.innerHTML=`<div class="card" style="text-align:center"><h2>Room <span style="color:var(--acc);letter-spacing:3px">${ROOM}</span></h2><p class="muted">Send friends this link. They open it, tap their name, and see the live board.</p><input readonly value="${u}" style="width:100%" onclick="this.select()"><div class="row" style="justify-content:center;margin-top:12px"><button class="y" data-x>Done</button></div></div>`;
+ m.onclick=e=>{if(e.target===m||e.target.dataset.x!==undefined)m.remove()};document.body.appendChild(m)}
+const myTurn=()=>!ROOM||(S&&(SEAT===who(S.picks.length)||(ISHOST&&OVR)));
+function seatPicker(){$("#app").innerHTML=`<div class="card setup" style="text-align:center"><h2>Room ${ROOM}</h2><p>Who are you?</p><div class="posbtns">${S.players.map((n,i)=>`<button onclick="setSeat(${i})">${esc(n)}</button>`).join("")}<button class="g" onclick="setSeat(-1)">👀 Spectate</button></div></div>`}
 const enc=o=>btoa(unescape(encodeURIComponent(JSON.stringify({...o,picks:o.picks.map(x=>[x.p,x.id,x.slot])})))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
 const dec=s=>{const o=JSON.parse(decodeURIComponent(escape(atob(s.replace(/-/g,"+").replace(/_/g,"/")))));o.picks=o.picks.map(([p,id,slot])=>({p,id,slot}));return o};
 function shareLink(){const u=location.href.split("#")[0]+"#d="+enc(S);navigator.clipboard?.writeText(u).then(()=>toast("Share link copied!"),()=>prompt("Copy this link:",u));if(!navigator.clipboard)prompt("Copy this link:",u)}
-function hdr(){const h=$("#hdr");if(!S){h.innerHTML="";return}
+function hdr(){const h=$("#hdr");
+ const live=ROOM?`<span class="chip" title="${LIVE?"connected":"connecting…"}">${LIVE?"🟢":"🟠"} Room <b>${ROOM}</b>${ISHOST?" · host":""}</span><button class="g" onclick="inviteBox()">Invite</button>${S?`<select onchange="setSeat(+this.value)" title="You are">${S.players.map((n,i)=>`<option value="${i}" ${SEAT===i?"selected":""}>${esc(n)}</option>`).join("")}<option value="-1" ${SEAT===-1?"selected":""}>Spectator</option></select>`:""}${ISHOST&&S?`<label class="chip"><input type="checkbox" ${OVR?"checked":""} onchange="OVR=this.checked;render()"> Host override</label>`:""}`:"";
+ if(!S){h.innerHTML=live;return}
+ if(ROOM){h.innerHTML=live+(ISHOST?`<button class="g" onclick="if(confirm('Start a new draft for everyone?'))commit({t:'new'})">New</button>`:"");return}
  h.innerHTML=view?`<span class="chip">👀 View-only</span><button class="g" onclick="importView()">Make it mine</button>`:
- `<button class="g" onclick="shareLink()">🔗 Share</button><button class="g" onclick="if(confirm('Start a new draft?')){S=null;localStorage.removeItem('pkdraft_state');render()}">New</button>`}
-function render(){hdr();if(!S)return setup();if(S.picks.length>=total())return results();draft()}
+ `<button class="y" onclick="goLive()">🌐 Go live</button><button class="g" onclick="shareLink()">🔗 Snapshot</button><button class="g" onclick="if(confirm('Start a new draft?')){S=null;localStorage.removeItem('pkdraft_state');render()}">New</button>`}
+function render(){hdr();if(ROOM&&!ISHOST&&!S){$("#app").innerHTML=`<div class="card setup">${LIVE?"Waiting for the host to set up the draft…":"Connecting to room "+ROOM+"… (the host's tab must be open)"}</div>`;return}if(ROOM&&S&&SEAT===null)return seatPicker();if(!S)return setup();if(S.picks.length>=total())return results();draft()}
 function setup(){
  const pl=JSON.parse(localStorage.getItem("pkdraft_lastplayers")||'["",""]');
  $("#app").innerHTML=`<div class="card setup"><h2 style="margin-top:0">Set up your draft</h2>
@@ -97,17 +157,17 @@ function setup(){
  <label>Draft order</label><select id="order"><option value="snake">Snake (1→N, N→1)</option><option value="linear">Linear (1→N every round)</option></select>
  <label>Generations</label><div class="row" id="gens">${GENS.map((_,i)=>`<label class="chip"><input type="checkbox" value="${i+1}" ${i==0?"checked":""}> Gen ${i+1}</label>`).join("")}</div>
  <label class="chip" style="margin-top:10px"><input type="checkbox" id="noleg" checked> Exclude legendaries & mythicals</label>
- <div class="row" style="margin-top:16px"><button class="y" id="go">Start draft 🏈</button><button class="g" onclick="document.querySelectorAll('#pls input').forEach(i=>i.value='');shuffle()" style="display:none"></button><label class="chip"><input type="checkbox" id="rand"> Randomize order</label></div></div>`;
+ <div class="row" style="margin-top:16px"><button class="y" id="go">Start draft 🏈</button><button class="g" onclick="document.querySelectorAll('#pls input').forEach(i=>i.value='');shuffle()" style="display:none"></button><label class="chip"><input type="checkbox" id="rand"> Randomize order</label>${ROOM?"":`<label class="chip"><input type="checkbox" id="live" checked> 🌐 Live room for friends</label>`}</div></div>`;
  const pls=$("#pls");const addP=v=>{if(pls.children.length>=8)return;const d=document.createElement("div");d.className="row players";d.style.marginBottom="6px";d.innerHTML=`<input placeholder="Player ${pls.children.length+1}" value="${esc(v)}"><button class="g">✕</button>`;d.querySelector("button").onclick=()=>{if(pls.children.length>2)d.remove()};pls.appendChild(d)};
  pl.forEach(addP);$("#addp").onclick=()=>addP("");
  $("#mode").onchange=e=>$("#sz").style.display=e.target.value==="classic"?"":"none";
- $("#go").onclick=()=>{let players=[...pls.querySelectorAll("input")].map((i,k)=>i.value.trim()||"Player "+(k+1));
+ $("#go").onclick=()=>{if(!$("#live")){const x=document.createElement("input");x.type="checkbox";x.id="live";x.hidden=true;document.body.appendChild(x)}let players=[...pls.querySelectorAll("input")].map((i,k)=>i.value.trim()||"Player "+(k+1));
   if(players.length<2)return toast("Need 2+ players");localStorage.setItem("pkdraft_lastplayers",JSON.stringify(players));
   if($("#rand").checked)players.sort(()=>Math.random()-.5);
   const gens=[...document.querySelectorAll("#gens input:checked")].map(i=>+i.value);if(!gens.length)return toast("Pick a generation");
   S={players,mode:$("#mode").value,size:Math.max(1,Math.min(30,+$("#size").value||6)),order:$("#order").value,gens,noLeg:$("#noleg").checked,picks:[]};
   const pool=POKE.filter(inPool).length;if(pool<total())return toast(`Pool has only ${pool} Pokémon for ${total()} picks`);
-  view=false;save();render()};
+  const NS=S;S=null;view=false;const live=$("#live").checked;commit({t:"setup",S:NS});if(live&&!ROOM)goLive()};
 }
 const inPool=p=>S.gens.includes(gen(p.id))&&!(S.noLeg&&LEG.has(p.id));
 const typeChips=ts=>`<div class="types">${ts.map(t=>`<span class="t" style="background:${TC[t]}">${t}</span>`).join("")}</div>`;
@@ -119,7 +179,7 @@ function draft(){
  const n=S.picks.length,cur=who(n),k=S.players.length,round=Math.floor(n/k)+1,taken=new Map(S.picks.map(x=>[x.id,x.p]));
  $("#app").innerHTML=`<div class="layout"><div>
  <div class="card turn"><div><div class="muted">Round ${round} · Pick ${n+1} of ${total()}</div><div>On the clock: <b>${esc(S.players[cur])}</b></div><div class="muted" style="font-size:12px">Next: ${[1,2,3].map(j=>n+j<total()?esc(S.players[who(n+j)]):null).filter(Boolean).join(" → ")||"—"}</div></div>
- <div class="row">${view?"":`<button class="g" id="undo" ${n?"":"disabled"}>↶ Undo</button><button class="g" id="rnd">🎲 Random pick</button>`}</div></div>
+ <div class="row">${view?"":`<button class="g" id="undo" ${n?"":"disabled"}>↶ Undo</button><button class="g" id="rnd" ${myTurn()?"":"disabled"}>🎲 Random pick</button>`}</div></div>${ROOM?`<div class="muted" style="margin:-6px 0 10px">${myTurn()?(SEAT===cur?"🟡 You're on the clock!":"Host override: picking for "+esc(S.players[cur])):"Waiting for "+esc(S.players[cur])+"…"}</div>`:""}
  <div class="filters"><input id="q" placeholder="Search name or #…" value="${esc(F.q)}"><select id="ft"><option value="">All types</option>${TYPES.map(t=>`<option ${F.type===t?"selected":""}>${t}</option>`).join("")}</select>
  <select id="fg"><option value="">All gens</option>${S.gens.map(g=>`<option value="${g}" ${F.gen==g?"selected":""}>Gen ${g}</option>`).join("")}</select>
  <select id="fs"><option value="">Sort: Dex #</option><option value="bst">Sort: Base stat total</option>${SL.map((l,k)=>`<option value="${k}">Sort: ${l}</option>`).join("")}<option value="h">Sort: Height</option><option value="w">Sort: Weight</option></select>
@@ -132,22 +192,23 @@ function draft(){
  grid();
  $("#q").oninput=e=>{F.q=e.target.value;grid()};$("#ft").onchange=e=>{F.type=e.target.value;grid()};$("#fg").onchange=e=>{F.gen=e.target.value;grid()};$("#fs").value=F.sort||"";$("#fs").onchange=e=>{F.sort=e.target.value;grid()};$("#hide").onchange=e=>{F.hide=e.target.checked;grid()};
  $("#grid").onclick=e=>{const ib=e.target.closest("[data-info]");if(ib)return openPick(+ib.dataset.info,true);const m=e.target.closest(".mon");if(!m||m.classList.contains("taken")||view)return;openPick(+m.dataset.id)};
- if(!view){$("#undo").onclick=()=>{const u=S.picks.pop();save();toast("Undid "+P(u.id).name);render()};
+ if(!view){$("#undo").onclick=()=>commit({t:"undo"});
   $("#rnd").onclick=()=>{const av=POKE.filter(p=>inPool(p)&&!taken.has(p.id));openPick(av[Math.floor(Math.random()*av.length)].id)}}
 }
-async function openPick(id,info){const p=P(id);await ensureStats(p);if(view||S.picks.some(x=>x.id===id))info=true;const cur=who(S.picks.length),used=new Set(S.picks.filter(x=>x.p===cur).map(x=>x.slot)),open=slotsOf().filter(s=>!used.has(s));
+async function openPick(id,info){const p=P(id);await ensureStats(p);if(view||!myTurn()||S.picks.some(x=>x.id===id))info=true;const cur=who(S.picks.length),used=new Set(S.picks.filter(x=>x.p===cur).map(x=>x.slot)),open=slotsOf().filter(s=>!used.has(s));
  const m=document.createElement("div");m.className="modal";
  m.innerHTML=`<div class="card"><img class="big" src="${art(id)}" onerror="this.src='${spr(id)}'"><h2 style="text-align:center;text-transform:capitalize;margin:6px 0">${esc(p.name)} <span class="muted">#${id}</span></h2>${typeChips(p.types)}
  ${p.s?`<p class="muted" style="text-align:center;margin:6px">${fmtHW(p)}</p><div class="stats">${p.s.map((v,k)=>`<div>${SL[k]}</div><div class="bar"><i style="width:${Math.min(100,v/2.55)}%;background:${v>=100?"#4caf50":v>=70?"#ffcb05":"#e3350d"}"></i></div><div>${v}</div>`).join("")}<div><b>Total</b></div><div></div><div><b>${bst(p)}</b></div></div>`:""}
  ${info?"":`<p style="text-align:center">${esc(S.players[cur])}, ${S.mode==="all22"?"pick a position:":"confirm your pick:"}</p>
  <div class="posbtns">${S.mode==="all22"?open.map(s=>`<button data-s="${s}">${s}</button>`).join(""):`<button class="y" data-s="${open[0]}">Draft ${esc(p.name)}</button>`}</div>`}
  <div class="row" style="justify-content:center;margin-top:12px"><button class="g" data-x>${info?"Close":"Cancel"}</button></div></div>`;
- m.onclick=e=>{if(e.target===m||e.target.dataset.x!==undefined)return m.remove();const s=e.target.dataset.s;if(!s)return;S.picks.push({p:cur,id,slot:s});save();m.remove();toast(`${S.players[cur]} drafted ${p.name}!`);render()};
+ m.onclick=e=>{if(e.target===m||e.target.dataset.x!==undefined)return m.remove();const s=e.target.dataset.s;if(!s)return;m.remove();commit({t:"pick",id,slot:s,ovr:ISHOST&&OVR})};
  document.body.appendChild(m)}
-function results(){$("#app").innerHTML=`<div class="card turn"><div><b>🏆 Draft complete!</b><div class="muted">${total()} picks · ${S.order} draft · ${S.mode==="all22"?"All‑22 lineups":"teams of "+S.size}</div></div><div class="row">${view?"":`<button class="g" onclick="S.picks.pop();save();render()">↶ Undo last pick</button>`}<button class="y" onclick="shareLink()">🔗 Share results</button></div></div>
+function results(){$("#app").innerHTML=`<div class="card turn"><div><b>🏆 Draft complete!</b><div class="muted">${total()} picks · ${S.order} draft · ${S.mode==="all22"?"All‑22 lineups":"teams of "+S.size}</div></div><div class="row">${view?"":`<button class="g" onclick="commit({t:'undo'})">↶ Undo last pick</button>`}<button class="y" onclick="shareLink()">🔗 Share results</button></div></div>
  <div class="results">${S.players.map((_,i)=>teamHTML(i,true)).join("")}</div>`}
 function importView(){view=false;save();history.replaceState(null,"",location.pathname);render()}
 (async()=>{try{await loadPoke()}catch(e){$("#app").innerHTML=`<div class="card">Couldn't load Pokémon from PokeAPI. Check your connection and reload.</div>`;return}
  const h=location.hash.match(/#d=(.+)/);if(h){try{S=dec(h[1]);view=true}catch(e){toast("Bad share link")}}
- if(!S){try{S=JSON.parse(localStorage.getItem("pkdraft_state"))}catch(e){}}render()})();
+ const rm=new URLSearchParams(location.search).get("room");if(rm&&!h)joinRoom(rm.toUpperCase().trim());
+ if(!S&&!ROOM){try{S=JSON.parse(localStorage.getItem("pkdraft_state"))}catch(e){}}render()})();
 </script></body></html>
